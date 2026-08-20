@@ -36,6 +36,7 @@ O projeto automatiza o fluxo de ponta a ponta tratando essas duas realidades, em
 | Automação de navegador | Playwright (Microsoft Edge, contexto persistente) |
 | Planilhas | openpyxl |
 | Configuração | Variáveis de ambiente (`python-dotenv`) |
+| Desenvolvimento assistido | Claude (IA) |
 
 ---
 
@@ -47,6 +48,7 @@ O projeto automatiza o fluxo de ponta a ponta tratando essas duas realidades, em
 - **Falha isolada por item.** Erro em um chamado registra o motivo, salva screenshot da tela no momento da falha e segue para o próximo. O lote nunca é derrubado por um caso.
 - **Diálogos de confirmação tratados por evento.** O popup de confirmação do ServiceNow pode surgir em qualquer ponto; o handler é registrado no evento de load da página, além de chamadas diretas nos pontos críticos.
 - **Sessão persistente, sem credenciais no código.** O login é feito manualmente uma única vez num perfil de navegador persistido em disco. A automação nunca lê, armazena ou digita senhas.
+- **Desenvolvimento assistido por IA.** O projeto foi construído com apoio de Claude na modelagem da lógica, na escrita e revisão do código e na depuração de seletores — com as regras de negócio, os critérios de validação e o comportamento em caso de falha definidos a partir do processo real e verificados em execução.
 
 ---
 
