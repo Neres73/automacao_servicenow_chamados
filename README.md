@@ -59,7 +59,7 @@ cd automacao_servicenow_chamados
 python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
 
-pip install -r requirements.txt
+pip install playwright openpyxl python-dotenv
 playwright install msedge
 ```
 
@@ -69,8 +69,15 @@ playwright install msedge
 
 Toda a configuração fica em variáveis de ambiente — **nenhum dado de ambiente corporativo é versionado**.
 
-```bash
-cp .env.example .env
+Crie um arquivo `.env` na raiz do projeto:
+
+```env
+SERVICENOW_URL=https://sua-instancia.service-now.com
+SERVICENOW_TASK_LIST_URL=
+EXCEL_LOCAL_PATH=
+EXCEL_ONLINE_URL=
+DOWNLOAD_DIR=./downloads
+USER_DATA_DIR=./perfil_navegador
 ```
 
 | Variável | Descrição | Obrigatória |
@@ -127,13 +134,11 @@ python main.py
 ```
 .
 ├── main.py            # fluxo completo: leitura, validação, fechamento e relatório
-├── requirements.txt
-├── .env.example       # modelo de configuração
-├── .gitignore         # ignora .env, perfil de navegador, planilhas e saídas
-└── README.md
+├── README.md
+└── LICENSE
 ```
 
-As pastas `downloads/`, `erros/`, `resultados/` e `perfil_navegador/` são criadas em tempo de execução e não são versionadas.
+O arquivo `.env` e as pastas `downloads/`, `erros/`, `resultados/` e `perfil_navegador/` são criados localmente, contêm dados do ambiente e **não devem ser versionados**.
 
 ---
 
