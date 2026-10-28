@@ -1,0 +1,21 @@
+# Configuração local (URLs, caminhos) — nunca versionar
+.env
+
+# Perfil do navegador com a sessão salva
+perfil_navegador/
+perfil_recebimento/
+
+# Planilhas e saídas de execução
+*.xlsx
+*.xlsm
+*.csv
+downloads/
+erros/
+resultados/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.idea/

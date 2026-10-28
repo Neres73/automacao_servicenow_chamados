@@ -1,113 +1,47 @@
-# Automação de Fechamento de Chamados — ServiceNow
+# ServiceNow — Encerramento de Ordens de Serviço em Lote
 
-Automação (RPA) em Python + Playwright que lê chamados de uma planilha Excel e executa o fluxo completo de fechamento no ServiceNow: localiza cada registro, valida o responsável, preenche horários reais e informações de fechamento e encerra — gerando relatório auditável de cada execução.
+Script em Python + Playwright que lê os chamados atendidos numa planilha Excel e encerra cada ordem de serviço no ServiceNow, preenchendo horários reais e informações de fechamento.
 
-> Processo antes executado manualmente, chamado a chamado, passou a rodar em lote sem intervenção humana — sobrando para a pessoa apenas os casos que exigem decisão.
-
----
-
-## Contexto
-
-O fechamento de ordens de serviço era feito um a um, a partir de uma planilha compartilhada com dezenas de registros por lote. A sequência de passos era sempre a mesma — abrir o chamado, aceitar, iniciar, preencher horários, fechar —, mas com dois agravantes que impedem uma automação ingênua:
-
-- **os dados de entrada são sujos**: a planilha é preenchida por várias pessoas, com números em formatos diferentes e datas em padrões mistos;
-- **o estado dos chamados varia**: parte deles já foi parcialmente processada por outra pessoa quando o lote roda.
-
-O projeto automatiza o fluxo de ponta a ponta tratando essas duas realidades, em vez de assumir o caminho feliz.
+Uso no meu trabalho, no back-office de Manutenção. O encerramento era dividido entre várias pessoas da equipe; com o script, uma pessoa só dá conta do lote.
 
 ---
 
-## Como funciona
+## Por que existe
 
-1. Obtém a planilha — arquivo local sincronizado (preferencial) ou download automático do Excel Online
-2. Lê e normaliza os dados de cada chamado (número, técnico, validador, horários)
-3. Localiza o registro no ServiceNow por busca filtrada via URL
-4. **Valida o técnico atribuído antes de qualquer ação** — divergência descarta o chamado
-5. Executa a sequência de fechamento: aceitar → iniciar trabalho → horários reais → informações de fechamento → encerrar
-6. Grava o status de volta na planilha (quando configurado) e emite relatório `.csv` da execução
+Cada encerramento segue sempre os mesmos passos (aceitar, iniciar, preencher horários, informar o fechamento, encerrar), mas dois detalhes impedem uma automação simples:
 
----
+- **A planilha é preenchida por várias pessoas**: números de chamado com espaço ou sem o zero da frente, datas e horas em formatos diferentes
+- **Os chamados não estão todos no mesmo estado**: alguns já foram aceitos, outros estão pausados
 
-## Stack
-
-| Camada | Tecnologia |
-|---|---|
-| Linguagem | Python 3.10+ |
-| Automação de navegador | Playwright (Microsoft Edge, contexto persistente) |
-| Planilhas | openpyxl |
-| Configuração | Variáveis de ambiente (`python-dotenv`) |
-| Desenvolvimento assistido | Claude (IA) |
+O script trata esses dois casos em vez de assumir que tudo está no formato e no estado esperados.
 
 ---
 
-## Decisões técnicas
+## O que o script faz
 
-- **Validação antes de ação.** O técnico atribuído no ServiceNow é conferido contra a planilha antes do primeiro clique. Num fluxo que encerra registros de trabalho, o erro seguro é não executar.
-- **Etapas idempotentes.** Cada passo do fechamento verifica se o controle existe na tela; se não existe, assume que a etapa já foi concluída por outra pessoa e continua do estado real do registro. O lote pode rodar sobre chamados em estágios diferentes sem quebrar.
-- **Normalização defensiva da entrada.** O número do chamado é reconstruído a partir do que a célula realmente contém — incluindo o caso clássico do Excel remover o zero à esquerda de células numéricas — e a estrutura da planilha é conferida pelos cabeçalhos, alertando se alguma coluna foi deslocada.
-- **Falha isolada por item.** Erro em um chamado registra o motivo, salva screenshot da tela no momento da falha e segue para o próximo. O lote nunca é derrubado por um caso.
-- **Diálogos de confirmação tratados por evento.** O popup de confirmação do ServiceNow pode surgir em qualquer ponto; o handler é registrado no evento de load da página, além de chamadas diretas nos pontos críticos.
-- **Sessão persistente, sem credenciais no código.** O login é feito manualmente uma única vez num perfil de navegador persistido em disco. A automação nunca lê, armazena ou digita senhas.
-- **Desenvolvimento assistido por IA.** O projeto foi construído com apoio de Claude na modelagem da lógica, na escrita e revisão do código e na depuração de seletores — com as regras de negócio, os critérios de validação e o comportamento em caso de falha definidos a partir do processo real e verificados em execução.
-
----
-
-## Instalação
-
-```bash
-git clone https://github.com/Neres73/automacao_servicenow_chamados.git
-cd automacao_servicenow_chamados
-
-python -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
-
-pip install playwright openpyxl python-dotenv
-playwright install msedge
-```
+1. **Obtém a planilha**: usa o arquivo local sincronizado (recomendado) ou baixa do Excel Online
+2. **Lê e corrige os dados**:
+   - Confere se os cabeçalhos estão nas colunas esperadas e avisa se a planilha mudou de estrutura
+   - Padroniza o número do chamado (`SGM` + 7 dígitos), corrigindo espaços e zeros à esquerda que o Excel remove
+   - Junta data e hora do atendimento em qualquer formato que o Excel entregue (data, texto ou fração do dia)
+3. **Para cada chamado**:
+   - Busca a tarefa (MAN) vinculada ao chamado e abre o registro
+   - **Confere se o técnico atribuído é o mesmo da planilha**; se não for, não mexe no chamado
+   - Executa só as etapas que ainda faltam: Aceitar → Start Work → Retomar Trabalho → Não aplicar material
+   - Preenche início e término reais na aba **Real**
+   - Preenche código de fechamento, validador e matrícula na aba **Informações de Fechamento**
+   - Clica em **Encerrado Concluído**
+4. **Registra o resultado** na planilha, em CSV e com print da tela nos erros
 
 ---
 
-## Configuração
+## Cuidados embutidos
 
-Toda a configuração fica em variáveis de ambiente — **nenhum dado de ambiente corporativo é versionado**.
-
-Crie um arquivo `.env` na raiz do projeto:
-
-```env
-SERVICENOW_URL=https://sua-instancia.service-now.com
-SERVICENOW_TASK_LIST_URL=
-EXCEL_LOCAL_PATH=
-EXCEL_ONLINE_URL=
-DOWNLOAD_DIR=./downloads
-USER_DATA_DIR=./perfil_navegador
-```
-
-| Variável | Descrição | Obrigatória |
-|---|---|---|
-| `SERVICENOW_URL` | URL base da instância do ServiceNow | Sim |
-| `SERVICENOW_TASK_LIST_URL` | URL da listagem de tarefas usada na busca | Não (padrão: `SERVICENOW_URL`) |
-| `EXCEL_LOCAL_PATH` | Caminho da planilha local sincronizada — recomendado; habilita a gravação do status de volta | Não |
-| `EXCEL_ONLINE_URL` | Link de download da planilha no Excel Online — usado quando não há arquivo local | Sim, se não houver `EXCEL_LOCAL_PATH` |
-| `DOWNLOAD_DIR` | Pasta de downloads temporários | Não (padrão: `./downloads`) |
-| `USER_DATA_DIR` | Pasta do perfil de navegador com a sessão salva | Não (padrão: `./perfil_navegador`) |
-
----
-
-## Uso
-
-### Primeira execução — autenticação
-
-```bash
-python main.py --login
-```
-
-Abre o navegador para login manual na Microsoft e no ServiceNow. A sessão fica persistida e as execuções seguintes já abrem autenticadas.
-
-### Execução normal
-
-```bash
-python main.py
-```
+- **Confirma cada mudança de status**: depois de Start Work, Retomar Trabalho e Encerrar, espera o botão sumir da tela, que é o sinal de que o ServiceNow aceitou. Se não aceitou, lê a mensagem de erro da tela e tenta mais uma vez. Se o Start Work ou o Retomar Trabalho continuarem sem efeito, para aquele chamado com o motivo em vez de seguir com dado errado; no encerramento, avisa no terminal
+- **Fecha o aviso de "chamados em andamento"** em qualquer ponto em que ele apareça, inclusive dentro do formulário
+- **Espera elementos concretos da tela** em vez de esperar a rede ficar parada, que no ServiceNow quase nunca acontece
+- **Erro em um chamado não derruba o lote**: o motivo é registrado e o script segue para o próximo
+- **Detecta sessão expirada** e orienta a refazer o login
 
 ---
 
@@ -115,35 +49,85 @@ python main.py
 
 | Saída | Onde | Conteúdo |
 |---|---|---|
-| Relatório | `resultados/relatorio_<timestamp>.csv` | Uma linha por chamado: número, sucesso/falha e motivo |
-| Lista de falhas | `resultados/sgms_com_falha_<timestamp>.txt` | Só os números que falharam, prontos para reprocessar |
-| Evidência de erro | `erros/erro_<numero>.png` | Screenshot da tela no momento de cada falha |
-| Status na planilha | Coluna "Status" (criada se não existir) | "Concluído" ou o motivo do erro — apenas com `EXCEL_LOCAL_PATH` |
+| Relatório | `resultados/relatorio_<data_hora>.csv` | Um chamado por linha: sucesso ou falha, com o motivo |
+| Lista de falhas | `resultados/sgms_com_falha_<data_hora>.txt` | Só os chamados que falharam, prontos para rodar de novo |
+| Prints de erro | `erros/erro_<chamado>.png` | Tela no momento de cada falha |
+| Status na planilha | Coluna "Status" (criada se não existir) | "Concluído" ou o motivo do erro (só com planilha local) |
 
 ---
 
-## Limitações e próximos passos
+## Instalação
 
-- Os seletores de interface são específicos da instância em que a automação foi desenvolvida — adaptar para outro ambiente exige ajustá-los no código
-- Execução sequencial e com navegador visível; modo headless ainda não foi validado
-- Sem suíte de testes automatizados — as funções puras de normalização são as primeiras candidatas
-- Próximas evoluções: `argparse` com modo `--dry-run` (simular o lote sem encerrar nada), `logging` estruturado em arquivo e separação em módulos (planilha / ServiceNow / relatório)
+Requisitos: Python 3.10+ e Microsoft Edge.
+
+```bash
+git clone https://github.com/Neres73/automacao_servicenow_chamados.git
+cd automacao_servicenow_chamados
+
+python -m venv .venv
+.venv\Scripts\activate            # Linux/Mac: source .venv/bin/activate
+
+pip install -r requirements.txt
+playwright install msedge
+```
+
+## Configuração
+
+Copie o modelo e preencha com os dados do seu ambiente:
+
+```bash
+copy .env.example .env            # Linux/Mac: cp .env.example .env
+```
+
+| Variável | O que é | Padrão |
+|---|---|---|
+| `SERVICENOW_URL` | URL da sua instância do ServiceNow | obrigatória |
+| `SERVICENOW_TASK_LIST_URL` | URL da lista de tarefas usada na busca | igual a `SERVICENOW_URL` |
+| `EXCEL_LOCAL_PATH` | Planilha local sincronizada (permite gravar o status) | — |
+| `EXCEL_ONLINE_URL` | Link de download da planilha no Excel Online | usado se não houver arquivo local |
+| `DOWNLOAD_DIR` | Pasta de downloads temporários | `./downloads` |
+| `USER_DATA_DIR` | Pasta do perfil do navegador com a sessão | `./perfil_navegador` |
+
+**Colunas lidas da planilha** (cabeçalho na linha 1):
+
+| Coluna | Conteúdo |
+|---|---|
+| E | Número Chamado SGM |
+| G | Técnico (comparado com o técnico atribuído no ServiceNow) |
+| I | Data de atendimento do chamado |
+| J / K | Horário de início / fim do atendimento |
+| L | Coordenador (validador) |
+| M | Matrícula do validador |
+
+Os seletores que podem variar de uma instância do ServiceNow para outra estão marcados no código com `🔧 AJUSTE AQUI`.
+
+## Uso
+
+```bash
+python main.py --login    # 1ª vez: abre o Edge para login na Microsoft e no ServiceNow; a sessão fica salva
+python main.py            # execuções seguintes
+```
+
+O script **não lê, guarda nem digita senha**.
 
 ---
+
+## Limitações
+
+- Seletores e campos personalizados são os da instância onde o script foi feito; outra instância exige ajustes
+- O código de fechamento é sempre "Outros"
+- Roda um chamado por vez, com o navegador visível
+- Sem modo de simulação: rodar o script **encerra os chamados de verdade**
 
 ## Estrutura
 
 ```
-.
-├── main.py            # fluxo completo: leitura, validação, fechamento e relatório
-├── README.md
-└── LICENSE
+├── main.py            # leitura da planilha, encerramento no ServiceNow e relatórios
+├── requirements.txt
+├── .env.example       # modelo de configuração
+└── .gitignore         # ignora .env, perfil do navegador, planilhas e saídas
 ```
-
-O arquivo `.env` e as pastas `downloads/`, `erros/`, `resultados/` e `perfil_navegador/` são criados localmente, contêm dados do ambiente e **não devem ser versionados**.
 
 ---
 
-## Aviso
-
-Projeto desenvolvido a partir de uma necessidade real de trabalho e compartilhado para fins de portfólio. Nenhuma URL, credencial ou dado corporativo está versionado neste repositório. Automações que interagem com sistemas corporativos devem sempre respeitar as políticas da organização.
+Desenvolvido por [Gustavo Neres](https://github.com/Neres73), com apoio do Claude (IA) para modelar a lógica, escrever e revisar o código. As regras de negócio e os critérios de validação vêm do processo real e foram verificados em execução. Projeto compartilhado como portfólio: nenhuma URL, credencial ou dado da empresa está no repositório. Licença MIT.

@@ -1,21 +1,20 @@
 """
 Automação de encerramento de ordens de serviço no ServiceNow.
 
-Lê os números SGM de uma planilha (Excel Online ou arquivo local
-sincronizado), localiza a tarefa MAN correspondente no ServiceNow e executa
-o fluxo completo de encerramento: aceite, início do trabalho, preenchimento
-dos horários reais, informações de fechamento e conclusão. Ao final, grava
-o status de cada chamado na planilha (quando aplicável) e gera relatório
-em CSV.
+Lê os chamados de uma planilha (arquivo local ou Excel Online), localiza a
+tarefa MAN de cada um, confere o técnico atribuído e executa o fluxo de
+encerramento: aceite, início/retomada do trabalho, horários reais,
+informações de fechamento e conclusão. Grava o status na planilha (quando
+local) e gera relatório CSV da execução.
 
-A autenticação usa um perfil de navegador persistente — o script nunca
-manipula credenciais.
+LOGIN: usa um perfil de navegador persistente — o script nunca lê, guarda
+ou digita usuário e senha.
 
-Uso:
-    python main.py --login    # primeira execução: login manual, salva a sessão
-    python main.py            # execução normal
+  Primeiro uso (login manual):   python main.py --login
+  Uso normal (já logado):        python main.py
 
-Configuração via arquivo .env — ver README.md.
+Configuração via arquivo .env (veja .env.example). Os seletores que podem
+variar entre instâncias do ServiceNow estão marcados com:  🔧 AJUSTE AQUI
 """
 
 import csv
@@ -23,12 +22,16 @@ import os
 import re
 import sys
 import time
-from datetime import datetime, date as date_cls, time as time_cls
+from datetime import datetime
 from pathlib import Path
 
-import openpyxl
 from dotenv import load_dotenv
-from playwright.sync_api import sync_playwright, Page, BrowserContext
+from playwright.sync_api import (
+    sync_playwright,
+    Page,
+    BrowserContext,
+    TimeoutError as PlaywrightTimeoutError,
+)
 
 load_dotenv()
 
@@ -49,62 +52,92 @@ RESULTADOS_DIR = Path("./resultados").resolve()
 RESULTADOS_DIR.mkdir(exist_ok=True, parents=True)
 
 # Índices (0-based) das colunas da planilha de chamados.
-COLUNA_SGM_INDEX = 4                  # E — "Número Chamado SGM"
-COLUNA_TECNICO_INDEX = 5              # F — técnico (validado contra o ServiceNow)
-COLUNA_VALIDADOR_INDEX = 6            # G — "Coordenador (a)" (validador)
-COLUNA_MATRICULA_INDEX = 7            # H — matrícula do validador
-COLUNA_DATA_ATENDIMENTO_INDEX = 8     # I — "Data de atendimento do chamado"
-COLUNA_HORARIO_INICIO_INDEX = 9       # J — "Horário de inicio do atendimento"
-COLUNA_HORARIO_TERMINO_INDEX = 10     # K — "Horário do fim do atendimento"
-
-# Formato de data/hora aceito pelos campos de data do ServiceNow.
-FORMATO_DATA_SERVICENOW = "%d/%m/%Y %H:%M:%S"
+COLUNA_SGM_INDEX = 4                  # Coluna E => "Número Chamado SGM"
+COLUNA_TECNICO_INDEX = 6              # Coluna G => nome do técnico (validado contra o ServiceNow)
+COLUNA_DATA_ATENDIMENTO_INDEX = 8     # Coluna I => "Data de atendimento do chamado"
+COLUNA_HORARIO_INICIO_INDEX = 9       # Coluna J => "Horário de inicio do atendimento"
+COLUNA_HORARIO_TERMINO_INDEX = 10     # Coluna K => "Horário do fim do atendimento"
+COLUNA_VALIDADOR_INDEX = 11           # Coluna L => "Coordenador (a)" (nome do validador)
+COLUNA_MATRICULA_INDEX = 12           # Coluna M => matrícula do validador
 
 
 # ============================================================================
-# ETAPA 1 — Obtenção da planilha
+# ESPERAS — substituem o antigo wait_for_load_state("networkidle")
+# ============================================================================
+# O ServiceNow mantém requisições em segundo plano o tempo todo (polling,
+# notificações, websocket), então "networkidle" quase nunca acontece e o
+# Playwright estoura o timeout de 30s. Em vez disso: esperamos o HTML
+# carregar (domcontentloaded) e depois um elemento CONCRETO da tela.
+
+# 🔧 AJUSTE AQUI se algum seletor não bater com o seu ServiceNow
+SELETOR_SERVICENOW_CARREGADO = "iframe#gsft_main, #gsft_main, sn-polaris-layout, table.data_list_table, form"
+SELETOR_LISTA_CARREGADA = "table.data_list_table, .list2_no_records, tr.list2_no_records"
+SELETOR_FORM_MAN = "input[id='sys_display.wm_task.assigned_to']"
+SELETOR_CAMPO_INICIO_REAL = "input[id='wm_task.work_start']"
+SELETOR_CODIGO_FECHAMENTO = "select[id='wm_task.u_fsm_close_code']"
+
+
+def aguardar_pagina(alvo, seletor: str = None, timeout: int = 30000, estado: str = "visible") -> None:
+    """
+    Espera o documento carregar (domcontentloaded) e, se informado, espera
+    o `seletor` ficar no `estado` pedido ("visible" ou "attached" — use
+    "attached" para <input type="hidden">).
+    """
+    alvo.wait_for_load_state("domcontentloaded", timeout=timeout)
+    if seletor:
+        alvo.locator(seletor).first.wait_for(state=estado, timeout=timeout)
+    else:
+        alvo.wait_for_timeout(1000)  # folga mínima quando não há seletor específico
+
+
+# ============================================================================
+# ETAPA 1 — Baixar a planilha atualizada do Excel Online
 # ============================================================================
 def baixar_planilha_excel_online(page: Page) -> Path:
-    """
-    Baixa a planilha a partir da URL do Excel Online.
-
-    A URL configurada serve o arquivo como download direto. Nesse cenário o
-    page.goto() levanta exceção — a navegação é interrompida quando vira
-    download —, comportamento esperado do Playwright; o download em si é
-    capturado pelo expect_download().
-    """
-    with page.expect_download() as download_info:
-        try:
-            page.goto(EXCEL_ONLINE_URL)
-        except Exception:
-            pass  # esperado: a navegação é abortada quando vira download
-    download = download_info.value
+    try:
+        with page.expect_download(timeout=30000) as download_info:
+            try:
+                page.goto(EXCEL_ONLINE_URL, timeout=30000)
+            except Exception:
+                pass  # esperado: a navegação "falha" porque virou download direto
+        download = download_info.value
+    except PlaywrightTimeoutError:
+        raise RuntimeError(
+            "Nenhum download começou em 30s ao acessar o Excel Online. "
+            "Provavelmente a sessão expirou (a página carregou uma tela de "
+            "login em vez de baixar o arquivo). Rode: python main.py --login "
+            "e faça login novamente. Também confira se não há outra janela "
+            "do Edge aberta usando o mesmo perfil (./perfil_navegador)."
+        )
 
     caminho_arquivo = DOWNLOAD_DIR / "planilha_chamados.xlsx"
     download.save_as(caminho_arquivo)
+
+    falha = download.failure()
+    if falha:
+        raise RuntimeError(f"Download falhou: {falha}")
+
     return caminho_arquivo
 
 
 # ============================================================================
-# ETAPA 2 — Leitura e normalização dos dados
+# ETAPA 2 — Ler os dados da planilha (SGM, início real, término real)
 # ============================================================================
 def combinar_data_hora(data_valor, hora_valor):
-    """
-    Combina a data de atendimento com um horário em um único datetime.
+    from datetime import datetime as dt, date as date_cls, time as time_cls
 
-    Aceita os tipos que o openpyxl pode entregar para células de data/hora
-    (datetime, date, time ou texto). Retorna None quando algum dos valores
-    não pode ser interpretado — o chamador decide como reportar.
-    """
-    if isinstance(data_valor, datetime):
+    if isinstance(data_valor, dt):
         data = data_valor.date()
     elif isinstance(data_valor, date_cls):
         data = data_valor
     elif isinstance(data_valor, str):
         data = None
-        for fmt in ("%d/%m/%Y", "%m/%d/%Y", "%d/%m/%y", "%m/%d/%y"):
+        # Inclui o formato ISO ("2026-10-22 00:00:00"), que aparece quando a
+        # célula de data está formatada como TEXTO na planilha.
+        for fmt in ("%d/%m/%Y", "%m/%d/%Y", "%d/%m/%y", "%m/%d/%y",
+                    "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
             try:
-                data = datetime.strptime(data_valor.strip(), fmt).date()
+                data = dt.strptime(data_valor.strip(), fmt).date()
                 break
             except ValueError:
                 continue
@@ -113,7 +146,7 @@ def combinar_data_hora(data_valor, hora_valor):
     else:
         return None
 
-    if isinstance(hora_valor, datetime):
+    if isinstance(hora_valor, dt):
         hora = hora_valor.time()
     elif isinstance(hora_valor, time_cls):
         hora = hora_valor
@@ -121,70 +154,49 @@ def combinar_data_hora(data_valor, hora_valor):
         hora = None
         for fmt in ("%H:%M:%S", "%H:%M"):
             try:
-                hora = datetime.strptime(hora_valor.strip(), fmt).time()
+                hora = dt.strptime(hora_valor.strip(), fmt).time()
                 break
             except ValueError:
                 continue
         if hora is None:
             return None
+    elif isinstance(hora_valor, (int, float)):
+        # Excel guarda hora como fração do dia (ex: 0.4375 = 10:30)
+        segundos = round(float(hora_valor) % 1 * 86400)
+        hora = time_cls(segundos // 3600 % 24, segundos % 3600 // 60, segundos % 60)
     else:
         return None
 
-    return datetime.combine(data, hora)
+    return dt.combine(data, hora)
 
 
 def formatar_data_hora_servicenow(valor) -> str:
-    """
-    Formata um datetime no padrão aceito pelos campos de data do ServiceNow
-    (DD/MM/AAAA HH:MM:SS), que difere do formato de exibição da planilha.
-
-    Valores que chegarem como texto puro são repassados como estão, com
-    aviso — a conversão só é garantida para objetos de data reais.
-    """
     if valor is None:
         return ""
     if hasattr(valor, "strftime"):
-        return valor.strftime(FORMATO_DATA_SERVICENOW)
+        return valor.strftime("%d/%m/%Y %H:%M:%S")
     texto = str(valor).strip()
-    print(f"Aviso: valor de data/hora veio como texto puro ('{texto}') e não foi "
-          "reformatado — confirmar se está em DD/MM/AAAA HH:MM:SS.")
+    print(f"⚠️  Aviso: valor de data/hora veio como texto puro ('{texto}'), não consegui reformatar — confirme se está no formato certo (DD/MM/AAAA HH:MM:SS).")
     return texto
 
 
 def normalizar_sgm(valor_bruto) -> str:
-    """
-    Normaliza o número SGM para o formato padrão "SGM" + 7 dígitos.
-
-    Trata os desvios comuns de digitação e de formatação do Excel:
-    - espaços em qualquer posição ("SGM 0670464") são removidos;
-    - células numéricas perdem o zero à esquerda ("0751687" é lido como
-      "751687"), então valores só com dígitos são completados com zfill(7)
-      antes de receber o prefixo.
-
-    Valores fora do padrão são usados como estão, com aviso para
-    conferência manual.
-    """
-    texto = str(valor_bruto).strip().replace(" ", "")
+    texto = str(valor_bruto).strip()
+    texto = texto.replace(" ", "")
 
     if texto.isdigit():
         texto = "SGM" + texto.zfill(7)
 
     if not re.fullmatch(r"SGM\d{7}", texto):
-        print(f"Aviso: SGM '{texto}' (original: '{valor_bruto}') fora do formato "
-              "esperado SGM + 7 dígitos — conferir manualmente.")
+        print(f"⚠️  Aviso: SGM '{texto}' (original: '{valor_bruto}') não está no "
+              "formato esperado SGM0999999 (SGM + 7 dígitos) — confira manualmente.")
 
     return texto
 
 
 def ler_itens_da_planilha(caminho_arquivo: Path) -> list[dict]:
-    """
-    Lê a planilha de chamados e devolve a lista de itens a processar.
+    import openpyxl
 
-    Antes da leitura, os cabeçalhos das colunas mapeadas são conferidos
-    contra os nomes esperados: se a estrutura da planilha mudar (uma coluna
-    inserida desloca todas as seguintes), o desvio é reportado em vez de
-    processar dados errados em silêncio.
-    """
     wb = openpyxl.load_workbook(caminho_arquivo, data_only=True)
     ws = wb.active
 
@@ -198,16 +210,16 @@ def ler_itens_da_planilha(caminho_arquivo: Path) -> list[dict]:
         COLUNA_HORARIO_TERMINO_INDEX: "Horário do fim do atendimento",
     }
     for indice, cabecalho_esperado in colunas_esperadas.items():
-        cabecalho_real = ws.cell(row=1, column=indice + 1).value  # openpyxl é 1-based
+        cabecalho_real = ws.cell(row=1, column=indice + 1).value
         if cabecalho_real != cabecalho_esperado:
             print(
-                f"Aviso: esperado o cabeçalho '{cabecalho_esperado}' na coluna "
-                f"{indice + 1}, encontrado '{cabecalho_real}'. A planilha pode "
+                f"⚠️  Aviso: esperava o cabeçalho '{cabecalho_esperado}' na coluna "
+                f"{indice + 1}, mas encontrei '{cabecalho_real}'. A planilha pode "
                 "ter mudado de estrutura."
             )
 
     itens = []
-    for row in ws.iter_rows(min_row=2):  # pula o cabeçalho
+    for row in ws.iter_rows(min_row=2):
         celula_sgm = row[COLUNA_SGM_INDEX]
         if not celula_sgm.value:
             continue
@@ -223,16 +235,16 @@ def ler_itens_da_planilha(caminho_arquivo: Path) -> list[dict]:
 
         inicio_combinado = combinar_data_hora(data_atendimento, hora_inicio)
         if inicio_combinado is None:
-            print(f"Aviso: não foi possível combinar data+hora de início do SGM "
+            print(f"⚠️  Aviso: não consegui combinar data+hora de início pro SGM "
                   f"{sgm_atual} (data='{data_atendimento}', hora='{hora_inicio}').")
 
         termino_combinado = combinar_data_hora(data_atendimento, hora_termino)
         if termino_combinado is None:
-            print(f"Aviso: não foi possível combinar data+hora de término do SGM "
+            print(f"⚠️  Aviso: não consegui combinar data+hora de término pro SGM "
                   f"{sgm_atual} (data='{data_atendimento}', hora='{hora_termino}').")
 
         itens.append({
-            "linha": celula_sgm.row,  # linha original, usada para gravar o status
+            "linha": celula_sgm.row,
             "sgm": sgm_atual,
             "inicio_real": formatar_data_hora_servicenow(inicio_combinado) if inicio_combinado else "",
             "termino_real": formatar_data_hora_servicenow(termino_combinado) if termino_combinado else "",
@@ -244,75 +256,47 @@ def ler_itens_da_planilha(caminho_arquivo: Path) -> list[dict]:
 
 
 # ============================================================================
-# ETAPA 3 — Localização e encerramento do chamado no ServiceNow
+# ETAPA 3 — Pesquisar o SGM no ServiceNow, clicar no MAN e preencher as etapas
 # ============================================================================
 def obter_alvo_servicenow(page: Page):
-    """
-    Retorna o objeto de interação correto para a tela atual: o iframe
-    'gsft_main' (interface clássica) quando existir, ou a própria página
-    (Next Experience).
-    """
     frame = page.frame(name="gsft_main")
     return frame if frame else page
 
 
 def montar_url_busca_por_sgm(sgm: str) -> str:
-    """
-    Monta a URL de busca da tarefa a partir do número SGM.
-
-    A tarefa MAN (tabela wm_task) é um registro filho do chamado de origem,
-    então a consulta filtra por 'parent.number' com STARTSWITH — buscar o
-    número do pai é o caminho direto até a tarefa correspondente.
-    """
     base = SERVICENOW_TASK_LIST_URL.split("?")[0]
     return f"{base}?sysparm_query=parent.numberSTARTSWITH{sgm}"
 
 
 def buscar_chamado_e_clicar_man(page: Page, sgm: str):
-    """
-    Pesquisa o SGM na listagem de tarefas e abre o registro MAN.
-
-    O número MAN não é um campo separado: é a numeração padrão dos
-    registros da tabela wm_task. Por isso o alvo do clique é qualquer link
-    cujo texto comece com "MAN" seguido de dígitos, independentemente da
-    posição na lista.
-    """
     if "login" in page.url.lower():
         raise RuntimeError(
             "Sessão do ServiceNow expirou ou não está logada. "
             "Rode: python main.py --login"
         )
 
-    page.goto(montar_url_busca_por_sgm(sgm))
-    page.wait_for_load_state("networkidle")
-
+    page.goto(montar_url_busca_por_sgm(sgm), wait_until="domcontentloaded")
     alvo = obter_alvo_servicenow(page)
+    aguardar_pagina(alvo, SELETOR_LISTA_CARREGADA)
 
     link_man = alvo.get_by_text(re.compile(r"^MAN\d+"))
 
-    # Sem resultados, falha imediatamente em vez de aguardar o timeout
-    # padrão de clique — acelera o avanço para o próximo chamado.
     if link_man.count() == 0:
         raise RuntimeError(f"SGM {sgm} não encontrado no ServiceNow.")
 
     link_man.first.click(timeout=5000)
-    alvo.wait_for_load_state("networkidle")
+    aguardar_pagina(obter_alvo_servicenow(page), SELETOR_FORM_MAN)
 
-    print(f"Chamado {sgm}: registro MAN aberto.")
+    print(f"Chamado {sgm}: entrou no registro MAN com sucesso.")
 
-    # O reload garante que o formulário carregue no estado atual do
-    # registro; como o iframe é recriado, o alvo é obtido novamente.
-    page.reload()
-    page.wait_for_load_state("networkidle")
+    page.reload(wait_until="domcontentloaded")
+    alvo = obter_alvo_servicenow(page)
+    aguardar_pagina(alvo, SELETOR_FORM_MAN)
     fechar_popup_chamados_pausados(page)
     return obter_alvo_servicenow(page)
 
 
 def obter_ou_criar_coluna_status(ws) -> int:
-    """
-    Localiza a coluna "Status" na planilha; se não existir, cria uma nova
-    após a última coluna usada. Retorna o índice 1-based.
-    """
     for cell in ws[1]:
         if cell.value == "Status":
             return cell.column
@@ -321,178 +305,272 @@ def obter_ou_criar_coluna_status(ws) -> int:
     return nova_coluna
 
 
-def fechar_popup_chamados_pausados(page: Page) -> None:
+def fechar_popup_chamados_pausados(page: Page) -> bool:
     """
-    Fecha o diálogo de confirmação de chamados em andamento ("Tem
-    certeza? ... Chamado(s): MANxxxxxxx") clicando em OK (id "ok_button").
+    Procura o botão OK do popup "chamados em andamento" na página E em todos
+    os iframes (inclusive o gsft_main, onde fica o formulário). Antes só a
+    página de fora era verificada — se o popup abria dentro do iframe, ele
+    ficava aberto bloqueando o Start Work.
+    """
+    fechou = False
+    for frame in page.frames:
+        try:
+            botao_ok = frame.locator("#ok_button")
+            if botao_ok.count() > 0 and botao_ok.first.is_visible():
+                botao_ok.first.click(timeout=2000)
+                print("  (popup 'chamados em andamento' fechado automaticamente)")
+                fechou = True
+        except Exception:
+            pass
+    return fechou
 
-    O diálogo pode surgir em qualquer ponto da execução, então esta função
-    é registrada no evento de load da página e também chamada diretamente
-    nos pontos críticos do fluxo. Falhas na checagem são ignoradas — a
-    ausência do diálogo é o caso normal.
-    """
+
+def ler_mensagens_erro_servicenow(alvo) -> str:
+    """Lê mensagens de erro/aviso exibidas no topo do formulário ou nos campos."""
     try:
-        botao_ok = page.locator("#ok_button")
-        if botao_ok.count() > 0 and botao_ok.first.is_visible():
-            botao_ok.first.click(timeout=2000)
-            print("  (diálogo de chamados em andamento fechado)")
+        textos = alvo.locator(
+            ".outputmsg_error, .outputmsg_warning, .fieldmsg.notification-error, "
+            "div.notification-error, .alert-danger"
+        ).all_inner_texts()
+        textos = [t.strip() for t in textos if t.strip()]
+        return " | ".join(textos)
     except Exception:
-        pass
+        return ""
 
 
-def clicar_se_existir(alvo, localizador, descricao: str) -> bool:
-    """
-    Clica no elemento se ele estiver presente; caso contrário, considera a
-    etapa já concluída (ou não aplicável) e segue sem erro. Retorna True se
-    clicou.
-
-    O force=True é necessário porque os botões de ação do ServiceNow podem
-    ficar recolhidos em um menu overflow quando a tela é estreita — o clique
-    é disparado mesmo sem a checagem de visibilidade.
-    """
+def clicar_se_existir(alvo, localizador, descricao: str, page: Page = None) -> bool:
     if localizador.count() == 0:
-        print(f"  (etapa \"{descricao}\" ignorada: não presente na tela — já concluída ou não se aplica)")
+        print(f"  (pulando \"{descricao}\": não encontrado na tela — provavelmente já foi feito)")
         return False
-    localizador.first.click(timeout=5000, force=True)
-    alvo.wait_for_load_state("networkidle")
-    return True
 
+    # Fecha o popup "chamados em andamento" (se estiver aberto) ANTES do
+    # clique — ele pode interceptar o clique no botão certo.
+    if page is not None:
+        fechar_popup_chamados_pausados(page)
 
-def clicar_esperando(alvo, localizador, descricao: str, segundos: int = 8) -> bool:
-    """
-    Variante de clicar_se_existir que aguarda o elemento surgir por até o
-    tempo indicado antes de desistir — para controles que aparecem alguns
-    instantes após a ação anterior. Retorna True se clicou.
-    """
     try:
-        localizador.first.wait_for(state="attached", timeout=segundos * 1000)
-    except Exception:
-        print(f"  (etapa \"{descricao}\" ignorada: não surgiu após {segundos}s — não se aplica)")
-        return False
-    localizador.first.click(timeout=5000, force=True)
-    alvo.wait_for_load_state("networkidle")
+        localizador.first.click(timeout=5000)
+    except Exception as erro:
+        # Último recurso: clique forçado (ignora overlays por cima).
+        print(f"  ⚠️  Clique normal em \"{descricao}\" falhou ({erro}); tentando clique forçado...")
+        if page is not None:
+            fechar_popup_chamados_pausados(page)
+        localizador.first.click(timeout=5000, force=True)
+
+    alvo.wait_for_timeout(500)  # dá tempo do ServiceNow iniciar o recarregamento
+    aguardar_pagina(alvo, SELETOR_FORM_MAN)
+
+    # Fecha o popup também DEPOIS do clique (ele pode surgir como reação ao
+    # Start Work, por exemplo).
+    if page is not None:
+        fechar_popup_chamados_pausados(page)
+
     return True
+
+
+def clicar_esperando(alvo, localizador, descricao: str, segundos: int = 8, page: Page = None) -> bool:
+    try:
+        localizador.first.wait_for(state="visible", timeout=segundos * 1000)
+    except Exception:
+        print(f"  (pulando \"{descricao}\": não apareceu após {segundos}s — provavelmente não se aplica)")
+        return False
+
+    if page is not None:
+        fechar_popup_chamados_pausados(page)
+
+    localizador.first.click(timeout=5000)
+    alvo.wait_for_timeout(500)
+    aguardar_pagina(alvo, SELETOR_FORM_MAN)
+
+    if page is not None:
+        fechar_popup_chamados_pausados(page)
+
+    return True
+
+
+def preencher_campo_oculto_servicenow(alvo, seletor: str, valor: str) -> None:
+    """
+    Preenche um <input type="hidden"> do ServiceNow (ex: "wm_task.work_start"/
+    "wm_task.work_end") setando o .value via JS e disparando "change", o que
+    aciona o onchange do próprio ServiceNow.
+    """
+    alvo.locator(seletor).evaluate(
+        """(el, valor) => {
+            el.value = valor;
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+        }""",
+        valor,
+    )
+    alvo.wait_for_timeout(300)  # pequena folga pra o onChange do ServiceNow processar
 
 
 def validar_tecnico_assignado(alvo, tecnico_planilha: str) -> None:
-    """
-    Confere se o técnico atribuído no ServiceNow corresponde ao informado
-    na planilha antes de qualquer ação sobre o chamado.
-
-    A comparação usa o primeiro nome e o operador "contém", porque o campo
-    do ServiceNow pode trazer matrícula ou outras informações junto ao
-    nome. Divergência interrompe o processamento deste chamado — ele é
-    registrado como falha no relatório.
-    """
     if not tecnico_planilha:
-        return  # sem nome na planilha, não há o que validar
+        return
 
     primeiro_nome = tecnico_planilha.strip().split()[0]
     valor_servicenow = alvo.input_value("input[id='sys_display.wm_task.assigned_to']")
 
     if primeiro_nome.lower() not in valor_servicenow.lower():
         raise RuntimeError(
-            f"Técnico não confere: esperado '{primeiro_nome}' no campo "
-            f"'Atribuído a', encontrado '{valor_servicenow.strip()}'."
+            f"Técnico não confere: esperava encontrar '{primeiro_nome}' no campo "
+            f"'Atribuído a', mas o valor lá é '{valor_servicenow.strip()}'."
         )
+
+
+def aguardar_transicao_de_estado(alvo, localizador_botao_clicado, descricao: str,
+                                 segundos: int = 10, page: Page = None,
+                                 obrigatorio: bool = False) -> bool:
+    """
+    Depois de clicar num botão que muda o ESTADO do chamado (Start Work,
+    Retomar Trabalho), espera o próprio botão sumir da tela — sinal de que
+    o ServiceNow confirmou a transição.
+
+    Se não sumir: fecha popups, lê mensagens de erro da tela e tenta clicar
+    de novo UMA vez. Se continuar sem efeito e `obrigatorio=True`, aborta o
+    chamado (com o motivo) em vez de seguir e falhar mais adiante.
+    """
+    try:
+        localizador_botao_clicado.first.wait_for(state="hidden", timeout=segundos * 1000)
+        return True
+    except Exception:
+        pass
+
+    # 1ª tentativa não funcionou — investiga e tenta de novo
+    popup_fechado = fechar_popup_chamados_pausados(page) if page is not None else False
+    msg = ler_mensagens_erro_servicenow(alvo)
+    print(f"  ⚠️  \"{descricao}\" não surtiu efeito em {segundos}s"
+          + (" (havia um popup aberto, já fechado)" if popup_fechado else "")
+          + (f". Mensagem do ServiceNow: {msg}" if msg else "")
+          + ". Tentando clicar de novo...")
+
+    try:
+        if localizador_botao_clicado.count() > 0 and localizador_botao_clicado.first.is_visible():
+            localizador_botao_clicado.first.click(timeout=5000)
+            alvo.wait_for_timeout(500)
+            if page is not None:
+                fechar_popup_chamados_pausados(page)
+        localizador_botao_clicado.first.wait_for(state="hidden", timeout=segundos * 1000)
+        print(f"  ✅ \"{descricao}\" confirmado na 2ª tentativa.")
+        return True
+    except Exception:
+        pass
+
+    msg = ler_mensagens_erro_servicenow(alvo)
+    texto = (f"\"{descricao}\" não mudou o estado do chamado após 2 tentativas"
+             + (f" — ServiceNow diz: {msg}" if msg else ""))
+    if obrigatorio:
+        raise RuntimeError(texto)
+    print(f"  ⚠️  {texto}. Seguindo mesmo assim.")
+    return False
 
 
 def preencher_etapas_man(page: Page, alvo, inicio_real: str, termino_real: str,
                           validador: str, matricula: str, tecnico: str) -> None:
     """
-    Executa o fluxo de encerramento dentro do registro MAN:
-    Aceitar -> Start Work -> Não Aplicar Material -> horários reais ->
-    informações de fechamento -> Encerrado Concluído.
-
-    As três primeiras etapas são opcionais por design: se o chamado já
-    avançou (outro usuário clicou em Aceitar, por exemplo), o botão
-    correspondente não existe e o fluxo continua do estado real do
-    registro. O chamado só é descartado se nenhuma das três etapas
-    iniciais estiver disponível.
-
-    Escolha de seletores: ids fixos ("accept", "close_complete") têm
-    prioridade sobre texto, que varia em caixa e acentuação. O padrão
-    "^Não Aplicar Material$" é ancorado para não colidir com o botão
-    vizinho "Aplicar Material".
+    Sequência dentro do chamado MAN:
+    Aceitar -> Start Work -> Retomar Trabalho -> Não aplicar material ->
+    aba "Real" -> preencher Início/Término real -> Encerrar Concluído.
+    Etapas iniciais são opcionais (pula as que já foram feitas).
     """
-    # A validação de técnico acontece antes de qualquer clique — impede
-    # aceitar ou processar chamado atribuído a outra pessoa.
     validar_tecnico_assignado(alvo, tecnico)
 
-    loc_aceitar = alvo.locator("#accept")
-    loc_start_work = alvo.get_by_text("Start Work", exact=True)
+    # 🔧 AJUSTE AQUI (1/5 a 4/5) — Aceitar / Start Work / Retomar Trabalho / Não aplicar material
+    loc_aceitar = alvo.get_by_text("Aceitar", exact=True)
+    loc_start_work = alvo.locator("//*[@id='start_work']")
+    loc_retomar = alvo.locator("//*[@id='resume_work']")
     loc_nao_aplicar = alvo.get_by_text(re.compile(r"^Não Aplicar Material$", re.IGNORECASE))
 
-    if loc_aceitar.count() == 0 and loc_start_work.count() == 0 and loc_nao_aplicar.count() == 0:
+    if (loc_aceitar.count() == 0 and loc_start_work.count() == 0
+            and loc_retomar.count() == 0 and loc_nao_aplicar.count() == 0):
         raise RuntimeError(
-            "Nenhuma das etapas iniciais (Aceitar / Start Work / Não Aplicar "
-            "Material) foi encontrada — chamado descartado."
+            "Nenhuma das etapas iniciais (Aceitar / Start Work / Retomar "
+            "Trabalho / Não aplicar material) foi encontrada — pulando esse "
+            "chamado."
         )
 
-    clicar_se_existir(alvo, loc_aceitar, "Aceitar")
-    clicar_se_existir(alvo, loc_start_work, "Start Work")
-    # Este controle surge alguns instantes após o Start Work, por isso a
-    # variante com espera.
-    clicar_esperando(alvo, loc_nao_aplicar, "Não Aplicar Material", segundos=8)
+    clicar_se_existir(alvo, loc_aceitar, "Aceitar", page=page)
 
-    # Aba "Real" — horários efetivos do atendimento.
-    alvo.locator("span.tab_caption_text:text-is('Real')").first.click(force=True)
-    alvo.wait_for_load_state("networkidle")
+    clicou_start_work = clicar_se_existir(alvo, loc_start_work, "Start Work", page=page)
+    if clicou_start_work:
+        aguardar_transicao_de_estado(alvo, loc_start_work, "Start Work",
+                                     page=page, obrigatorio=True)
 
-    # Campos de data do ServiceNow só confirmam o valor quando o campo
-    # perde o foco — o Tab após cada preenchimento simula esse comportamento.
-    alvo.fill("input[id='wm_task.work_start']", inicio_real)
-    alvo.press("input[id='wm_task.work_start']", "Tab")
+    clicou_retomar = clicar_se_existir(alvo, loc_retomar, "Retomar Trabalho", page=page)
+    if clicou_retomar:
+        aguardar_transicao_de_estado(alvo, loc_retomar, "Retomar Trabalho",
+                                     page=page, obrigatorio=True)
 
-    alvo.fill("input[id='wm_task.work_end']", termino_real)
-    alvo.press("input[id='wm_task.work_end']", "Tab")
+    clicar_esperando(alvo, loc_nao_aplicar, "Não aplicar material", segundos=8, page=page)
 
-    # Aba "Informações de Fechamento".
-    alvo.locator("span.tab_caption_text:text-is('Informações de Fechamento')").first.click(force=True)
-    alvo.wait_for_load_state("networkidle")
+    # --- Aba "Real" ---
+    fechar_popup_chamados_pausados(page)
+    alvo.locator("span.tab_caption_text:text-is('Real')").first.click()
+    # O campo é <input type="hidden">, por isso estado "attached" (não "visible")
+    aguardar_pagina(alvo, SELETOR_CAMPO_INICIO_REAL, estado="attached")
+
+    preencher_campo_oculto_servicenow(alvo, "input[id='wm_task.work_start']", inicio_real)
+    preencher_campo_oculto_servicenow(alvo, "input[id='wm_task.work_end']", termino_real)
+
+    # --- Aba "Informações de Fechamento" ---
+    fechar_popup_chamados_pausados(page)
+    alvo.locator("span.tab_caption_text:text-is('Informações de Fechamento')").first.click()
+    aguardar_pagina(alvo, SELETOR_CODIGO_FECHAMENTO)
 
     alvo.select_option("select[id='wm_task.u_fsm_close_code']", "Outros")
+
     alvo.fill("input[id='wm_task.u_validated_by']", validador)
     alvo.fill("input[id='wm_task.u_validated_id_by']", matricula)
 
     fechar_popup_chamados_pausados(page)
 
-    alvo.locator("#close_complete").click(force=True)
-    alvo.wait_for_load_state("networkidle")
+    loc_close_complete = alvo.locator("#close_complete")
+    try:
+        loc_close_complete.wait_for(state="visible", timeout=15000)
+    except Exception:
+        raise RuntimeError(
+            "Botão 'Encerrado Concluído' (#close_complete) não apareceu depois "
+            "de preencher os campos. Provavelmente uma etapa anterior (Start "
+            "Work / Retomar Trabalho / preenchimento de Início-Término real) "
+            "não foi confirmada de verdade pelo ServiceNow — confira a "
+            "screenshot do erro pra ver em que estado o chamado ficou."
+        )
+    loc_close_complete.click()
+    # Espera o botão sumir = ServiceNow processou o encerramento
+    aguardar_transicao_de_estado(alvo, loc_close_complete, "Encerrado Concluído", segundos=15)
+    aguardar_pagina(alvo)
 
-    print(f"  Início real: {inicio_real} | Término real: {termino_real} — chamado encerrado.")
+    print(f"  Início real: {inicio_real} | Término real: {termino_real} preenchidos e encerrado.")
 
 
 # ============================================================================
-# Login manual (modo --login)
+# LOGIN MANUAL (modo --login)
 # ============================================================================
 def fazer_login_manual(context: BrowserContext) -> None:
-    """
-    Abre as páginas de autenticação para login manual e persiste a sessão
-    no perfil de navegador. As credenciais nunca passam pelo script.
-    """
     page = context.new_page()
     page.goto(EXCEL_ONLINE_URL)
-    print("\n>>> Faça login na Microsoft nesta janela (Excel Online).")
+    print("\n>>> Faça login manualmente na Microsoft nesta janela (Excel Online).")
 
     page2 = context.new_page()
     page2.goto(SERVICENOW_URL)
-    print(">>> Faça login no ServiceNow nesta outra aba.")
+    print(">>> Faça login manualmente no ServiceNow nesta outra aba.")
 
-    input("\nApós logar nos dois, volte aqui e pressione Enter para salvar a sessão...")
+    input("\nDepois de logar nos dois, volte aqui e aperte Enter para salvar a sessão...")
     print("Sessão salva em:", USER_DATA_DIR)
 
 
 # ============================================================================
-# Execução principal
+# EXECUÇÃO PRINCIPAL
 # ============================================================================
 def main() -> None:
     modo_login = "--login" in sys.argv
 
+    if not SERVICENOW_URL:
+        sys.exit("SERVICENOW_URL não configurada. Copie o .env.example para .env e preencha.")
+    if not EXCEL_LOCAL_PATH and not EXCEL_ONLINE_URL:
+        sys.exit("Configure EXCEL_LOCAL_PATH ou EXCEL_ONLINE_URL no .env.")
+
     with sync_playwright() as p:
-        # O contexto persistente mantém cookies e sessão entre execuções,
-        # como um perfil de navegador comum. channel="msedge" usa o Edge
-        # instalado no sistema em vez do Chromium empacotado.
         context = p.chromium.launch_persistent_context(
             user_data_dir=str(USER_DATA_DIR),
             channel="msedge",
@@ -507,9 +585,6 @@ def main() -> None:
 
         page = context.pages[0] if context.pages else context.new_page()
 
-        # Diálogos nativos do navegador são aceitos automaticamente; o
-        # diálogo relevante do ServiceNow é HTML comum e é tratado por
-        # fechar_popup_chamados_pausados, registrada no evento de load.
         page.on("dialog", lambda dialog: dialog.accept())
         page.on("load", lambda *_args: fechar_popup_chamados_pausados(page))
 
@@ -519,9 +594,9 @@ def main() -> None:
         else:
             if EXCEL_LOCAL_PATH:
                 print(
-                    f"Aviso: EXCEL_LOCAL_PATH configurado ('{EXCEL_LOCAL_PATH}'), "
-                    "mas o arquivo não foi encontrado. Usando o download via "
-                    "Excel Online."
+                    f"⚠️  EXCEL_LOCAL_PATH foi configurado ('{EXCEL_LOCAL_PATH}') mas "
+                    "o arquivo não foi encontrado nesse caminho. Caindo para o "
+                    "método via Excel Online."
                 )
             print("Baixando a planilha do Excel Online...")
             caminho_planilha = baixar_planilha_excel_online(page)
@@ -529,27 +604,32 @@ def main() -> None:
         itens = ler_itens_da_planilha(caminho_planilha)
         print(f"{len(itens)} chamado(s) encontrado(s) na planilha.")
 
-        # O status só é gravado de volta quando a origem é o arquivo local
-        # sincronizado — escrever na cópia temporária baixada do Excel
-        # Online não refletiria na planilha usada pela equipe.
+        import openpyxl
         permite_escrever_status = bool(EXCEL_LOCAL_PATH) and caminho_planilha == Path(EXCEL_LOCAL_PATH)
 
         if permite_escrever_status:
-            wb_escrita = openpyxl.load_workbook(caminho_planilha)  # sem data_only: preserva fórmulas
+            wb_escrita = openpyxl.load_workbook(caminho_planilha)
             ws_escrita = wb_escrita.active
             coluna_status = obter_ou_criar_coluna_status(ws_escrita)
             wb_escrita.save(caminho_planilha)
-            print(f"Status será gravado na planilha local (coluna {coluna_status}).")
+            print(f"Status será escrito na planilha local (coluna {coluna_status}).")
         else:
             print(
-                "Aviso: EXCEL_LOCAL_PATH não configurado (ou não é o arquivo em "
-                "uso) — o status não será gravado na planilha; a cópia baixada "
-                "do Excel Online é temporária."
+                "⚠️  Aviso: EXCEL_LOCAL_PATH não está configurado (ou não é o arquivo "
+                "em uso agora) — o Status NÃO será escrito de volta na planilha, já "
+                "que a cópia baixada do Excel Online é só temporária."
             )
 
         print("Acessando o ServiceNow...")
-        page.goto(SERVICENOW_URL)
-        page.wait_for_load_state("networkidle")
+        page.goto(SERVICENOW_URL, wait_until="domcontentloaded")
+        try:
+            # Até 2 min: dá tempo de concluir SSO/MFA se a sessão tiver expirado
+            aguardar_pagina(page, SELETOR_SERVICENOW_CARREGADO, timeout=120000)
+        except PlaywrightTimeoutError:
+            raise RuntimeError(
+                "O ServiceNow não carregou em 2 minutos. Verifique se a sessão "
+                "expirou (tela de login/SSO) — se sim, rode: python main.py --login"
+            )
 
         sucesso = []
         falha = []
@@ -574,19 +654,15 @@ def main() -> None:
                 if permite_escrever_status:
                     ws_escrita.cell(row=item["linha"], column=coluna_status, value=str(erro))
                     wb_escrita.save(caminho_planilha)
-                # Screenshot no momento da falha — evita ter que reproduzir
-                # o erro para investigar.
                 try:
                     caminho_print = ERROS_DIR / f"erro_{sgm}.png"
                     page.screenshot(path=str(caminho_print))
                     print(f"  Screenshot do erro salva em: {caminho_print}")
                 except Exception:
-                    pass  # a falha do screenshot não interrompe o lote
+                    pass
 
-            time.sleep(1)  # pausa entre chamados para não sobrecarregar o ServiceNow
+            time.sleep(1)
 
-        # Relatório persistente da execução — o terminal não é a única
-        # fonte para revisar o que falhou.
         agora = datetime.now().strftime("%Y%m%d_%H%M%S")
 
         caminho_relatorio = RESULTADOS_DIR / f"relatorio_{agora}.csv"
@@ -610,7 +686,7 @@ def main() -> None:
             for sgm, motivo in falha:
                 print(f"  - {sgm}: {motivo}")
         print(f"\nRelatório completo salvo em: {caminho_relatorio}")
-        print(f"Lista dos SGMs com falha salva em: {caminho_falhas}")
+        print(f"Lista só dos SGMs com falha salva em: {caminho_falhas}")
 
         context.close()
 
